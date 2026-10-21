@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+downloads/
+xdld.db
+xdld.db-wal
+xdld.db-shm
+cookies.json
+cookies.txt
+index.jsonl
+.ruff_cache/

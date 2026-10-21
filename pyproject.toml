@@ -1,0 +1,31 @@
+[project]
+name = "xdld"
+version = "0.1.0"
+description = "Download the highest-resolution videos from a Twitter/X user's liked tweets"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "twifork>=2.4.0",
+    "httpx>=0.26",
+]
+
+[project.optional-dependencies]
+# Some X edges reject the default httpx TLS fingerprint with a 403 HTML page.
+impersonate = ["curl_cffi>=0.7,<0.8"]
+# Fallback for tweets that only expose an HLS (m3u8) stream.
+hls = ["yt-dlp"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+xdld = "xdld.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["xdld*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

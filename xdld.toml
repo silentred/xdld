@@ -1,0 +1,39 @@
+# xdld configuration. Every key can also be set as an env var
+# (XDLD_PROXY, XDLD_COOKIES, ...) or overridden per command line.
+
+# All traffic to x.com / video.twimg.com goes through this proxy.
+proxy = "http://127.0.0.1:7897"
+
+# Browser cookie export (auth_token + ct0 are required).
+cookies = "cookies.json"
+
+# Where videos are written.
+output_dir = "downloads"
+
+# Where the "what did I already download" state lives.
+db = "xdld.db"
+
+# 0 == walk the whole like list.
+max_likes = 0
+
+# Tweets requested per API page.
+page_size = 40
+
+# Seconds to wait between pages (randomised inside this range).
+sleep_min = 1.0
+sleep_max = 2.5
+
+# Stop after this many already-downloaded tweets in a row.
+stop_after_known = 50
+
+# Start at this page of the likes timeline (1 == the newest page).
+from_page = 1
+
+# Also download images (off by default).
+download_images = false
+
+# {tweet_id} {user} {index} {ext} {date} {media_id}
+filename_template = "{tweet_id}_{user}_{index}{ext}"
+
+# Set to e.g. "chrome124" (needs: pip install "xdld[impersonate]").
+impersonate = ""
