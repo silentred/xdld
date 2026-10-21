@@ -9,7 +9,6 @@ downloads/
 xdld.db
 xdld.db-wal
 xdld.db-shm
-cookies.json
-cookies.txt
 index.jsonl
-.ruff_cache/
+cookies.txt
+cookies.json

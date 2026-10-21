@@ -28,7 +28,7 @@ class Config:
     impersonate: str = ""
 
     # --- auth ---
-    cookies: str = "cookies.json"
+    cookies: str = "cookies.txt"
 
     # --- storage ---
     output_dir: str = "downloads"

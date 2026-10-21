@@ -192,6 +192,53 @@ async def test_run_download_is_idempotent(tmp_path, monkeypatch):
     assert calls["n"] == 1
 
 
+async def test_run_download_registers_a_file_that_is_already_on_disk(tmp_path, monkeypatch):
+    """The state was lost (deleted db) but the video is there: register it
+    instead of downloading the same file again."""
+    from pathlib import Path
+
+    tweet = FakeTweet("333", [_video("m1")])
+    calls = {"n": 0}
+
+    async def fake_get_user_tweets(user_id, tweet_type, count=40, cursor=None):
+        return FakeResult([tweet])
+
+    async def fake_download(url, dest, proxy=None, overwrite=False, on_progress=None, on_retry=None):
+        calls["n"] += 1
+        return 10
+
+    client = SimpleNamespace(
+        get_user_tweets=fake_get_user_tweets,
+        is_logged_in=lambda: _true(),
+        user=lambda: _user(),
+        user_id=lambda: _user_id(),
+    )
+    monkeypatch.setattr("xdld.runner.build_client", lambda cfg: client)
+    monkeypatch.setattr("xdld.runner.download_file", fake_download)
+
+    cfg = Config(
+        cookies=str(tmp_path / "c.json"),
+        output_dir=str(tmp_path / "out"),
+        db=str(tmp_path / "s.db"),
+        sleep_min=0,
+        sleep_max=0,
+    )
+    existing = Path(cfg.output_dir) / "333_alice_0.mp4"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_bytes(b"x" * 10)
+
+    stats = await run_download(cfg, log=lambda *a: None)
+
+    assert calls["n"] == 0
+    assert stats.downloaded == 0
+    assert stats.skipped == 1
+
+    from xdld.store import Store
+
+    with Store(cfg.db) as store:
+        assert store.media_status("m1") == "done"
+
+
 def _true():
     async def _inner():
         return True

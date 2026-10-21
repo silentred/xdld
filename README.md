@@ -53,11 +53,13 @@ python3.12 -m venv .venv          # 3.12/3.13 都可以，3.14 目前对 Js2Py �
 1. 用 Chrome/Edge 正常登录 <https://x.com>
 2. 安装浏览器扩展 **Get cookies.txt LOCALLY**（Chrome 商店 / Firefox 附加组件）
 3. 在 x.com 页面上点开扩展 → **Export cookies** → 保存为 `cookies.txt`
-4. 放到项目根目录，然后：
+4. 放到项目根目录（默认就叫 `cookies.txt`，无需改名），然后：
 
 ```bash
-mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cookies.txt 即可
+ls cookies.txt          # 文件名无所谓，格式是 Netscape cookies.txt 就行
 ```
+
+> 没有扩展？用 `tools/cookies_via_playwright.py` 手动登录一次，工具会直接写 `cookies.txt`。
 
 也支持这两种格式，工具会自动识别：
 
@@ -95,6 +97,14 @@ mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cooki
 
 # 不显示实时进度行（只保留普通日志）
 .venv/bin/xdld run --quiet
+
+# 导出 aria2c 下载清单（下载完用 xdld record 登记）
+.venv/bin/xdld export --limit 100
+aria2c -c -x 4 -s 4 -j 4 -i downloads/aria2.txt
+.venv/bin/xdld record -i downloads/aria2.txt
+
+# 排查问题：打印 query id、user id、每步耗时，失败时打印状态码/响应体/响应头
+.venv/bin/xdld check --verbose
 ```
 
 常用参数：
@@ -111,6 +121,7 @@ mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cooki
 | `--since-tweet ID` | 从这条推文开始（含），往更老的推文走 |
 | `--from-page N` | 从第 N 页开始（1 = 最新页） |
 | `--quiet` | 关掉实时进度行 |
+| `-v, --verbose` | 详细诊断（query id、user id、耗时、失败时的状态码/响应体/响应头/处理建议） |
 | `--impersonate chrome124` | 浏览器 TLS 指纹，配合 `[impersonate]` 附加依赖 |
 
 ### 实时进度
@@ -130,9 +141,12 @@ mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cooki
 * `xdld.db`（SQLite）记录每条媒体：`media_id`、推文 ID、本地路径、字节数、状态。
 * 同一个 `media_id` 只会下载一次——即使它在多条被点赞的推文里出现。
 * 再次运行 `xdld run` 时，**已下载的直接跳过**；本地文件被删了会自动重下。
+* 如果 `xdld.db` 丢了但视频还在磁盘上，工具会把已有文件登记回数据库（不重新下载）。
 * 点赞列表是按时间倒序的，所以连续遇到 50 条已下载的记录后就会自动收工（`stop_after_known`），不用每次都重头爬。
 * 下载中断不会留下半截文件：先写 `xxx.mp4.part`，成功后再改名。
 * **断点续传**：如果上次留下了 `.part` 文件，下次会用 HTTP `Range` 从断点继续（而不是从头下）；代理掉线也会自动重试 3 次，每次都接着上次的位置。视频再大也不用担心重来一遍。
+
+> ⚠️ `downloads/`、`xdld.db`、`cookies.txt` 都在 `.gitignore` 里（它们是本机状态，不该进仓库）。**别对仓库执行 `git clean -fdx`**——那会把已下载的视频、去重数据库和 Cookie 一起删掉。想清缓存就删 `__pycache__` 和 `.pytest_cache`。
 
 ### 断点续传
 
@@ -158,6 +172,56 @@ mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cooki
 
 ---
 
+## 5.5 用 aria2c 下载（导出下载清单）
+
+不想让 xdld 自己拉视频？可以让它把点赞列表导出成 **aria2c 的下载清单**，用 aria2c 下载（多线程、断点续传、支持代理），下完再用 `xdld record` 把这些 id 登记回数据库。
+
+```bash
+# 1) 导出清单（默认写到 <下载目录>/aria2.txt）
+.venv/bin/xdld export --limit 100
+
+# 2) 用 aria2c 下载（清单里已经带好了 dir/out/代理）
+aria2c -c -x 4 -s 4 -j 4 -i downloads/aria2.txt
+
+# 3) 下完之后登记：这些 media_id 从此标记为“已下载”
+.venv/bin/xdld record -i downloads/aria2.txt
+
+# 4) 再导出一次 → 已经下过的不会再出现
+.venv/bin/xdld export --limit 100
+```
+
+清单长这样（aria2c 输入文件格式：URI 一行，接下来的行是这条 URI 的选项，必须缩进）：
+
+```
+# xdld - aria2c input file
+# generated: 2026-10-21 18:43:40
+# files: 2
+# usage: aria2c -c -x 4 -s 4 -j 4 -i <this file>
+# after the download: xdld record <this file>
+
+# xdld-meta {"tweet_id": "2112022615082832063", "media_id": "2112018771363971072", "kind": "video", "author": "EasonnLl", "created_at": "..."}
+https://video.twimg.com/amplify_video/2112018771363971072/vid/avc1/1280x718/WZ_GIeXYyRqo1Tda.mp4?tag=29
+  dir=/Users/me/xdld/downloads
+  out=2112022615082832063_EasonnLl_0.mp4
+  header=User-Agent: Mozilla/5.0 ...
+  all-proxy=http://127.0.0.1:7897
+  continue=true
+  auto-file-renaming=false
+  allow-overwrite=true
+```
+
+要点：
+
+* **输出文件名带 tweet id**：`out=2112022615082832063_EasonnLl_0.mp4`，文件名模板可以用 `--template` 改（可用占位符：`{tweet_id} {user} {index} {ext} {date} {media_id}`）。
+* **`dir=` 是绝对路径**，aria2c 会把文件放到那里；`--dir` 可以把下载目录换成别的。
+* **`# xdld-meta` 注释里存了元数据**（tweet_id / media_id / 作者 / 时间），`xdld record` 就是靠它把下载结果写回数据库的。注释对 aria2c 无影响。
+* `xdld record` 会检查文件是否真的存在，缺失的会列出来（`missing: ...`），不会误标记；确实想要“不管在不在都记上”可以加 `--assume-done`。
+* `xdld record -i -` 可以从标准输入读清单。
+
+> ⚠️ aria2c 不支持在输入文件里写全局选项（开头一行 `split=4` 会被当成 URI 报错），所以代理等设置是**逐条**写在每个下载下面的。
+
+---
+
 ## 6. 代理
 
 `xdld.toml` 里的 `proxy` 会同时作用于：
@@ -176,11 +240,14 @@ mv cookies.txt cookies.json      # 文件名无所谓，格式是 Netscape cooki
 | --- | --- |
 | `cookies rejected by X` | Cookie 过期了，重新导出（有效期通常几天） |
 | `likes: FAIL ... status: 404` | X 轮换了 GraphQL query id。执行 `xdld refresh-ops` 让它去前端 bundle 里找新的 id 并打补丁 |
+| `status: 422 ... cannot be null ... userId` | 没读到账号 id（登录探测失败），重导 Cookie；`--verbose` 能看到完整响应体 |
 | `status: 403`（HTML 页面） | 装 `[impersonate]` 附加依赖，然后 `--impersonate chrome124` |
 | `status: 429` | 调大 `--sleep 2 5`，并降低 `--page-size` |
 | 视频下载 403 | 视频 CDN 也走代理了；确认代理支持 HTTPS CONNECT |
 | 视频下载中途 `ConnectError` | 代理抽风。程序会自动重试并从断点继续；持续失败就换个代理节点 |
 | `AccountLocked` / 验证码 | X 风控。降低频率、换 IP、养几天号 |
+
+`xdld check --verbose` 会额外打印：当前 GraphQL query id、读到的 user id、每一步耗时；一旦失败还会打印 HTTP 状态码、X 返回的原始响应体、有用的响应头（`x-rate-limit-*`、`cf-ray`、`x-client-transaction-id`）以及针对 401/403/404/422/429 的处理建议。
 
 `xdld refresh-ops` 做的事：抓取登录后的 x.com 页面 → 找到前端 js bundle → 正则出 `Likes` 操作的新 query id → 在当前进程里打补丁并重试。
 
@@ -199,10 +266,12 @@ xdld/
 │   ├── media.py      # 挑选最高码率（=最高分辨率）变体
 │   ├── download.py   # 流式下载、.part 断点续传、HLS 兜底
 │   ├── progress.py   # 实时进度行 / 心跳
+│   ├── diag.py       # 失败诊断（状态码 / 响应体 / 响应头 / 处理建议）
+│   ├── manifest.py   # aria2c 下载清单（导出 / 回写元数据）
 │   ├── store.py      # SQLite 去重 / 状态
 │   ├── discover.py   # 404 时自动找回 GraphQL query id
 │   └── runner.py     # 主流程编排
-└── tests/            # pytest（52 个用例，mock 掉 X 客户端）
+└── tests/            # pytest（72 个用例，mock 掉 X 客户端）
 ```
 
 ---

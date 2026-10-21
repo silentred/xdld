@@ -22,12 +22,10 @@ def test_parse_browser_export_list():
 
 
 def test_parse_netscape_cookies_txt():
-    text = "\n".join(
-        [
-            "# Netscape HTTP Cookie File",
-            ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\ta",
-            ".x.com\tTRUE\t/\tTRUE\t0\tct0\tb",
-        ]
+    text = (
+        "# Netscape HTTP Cookie File\n"
+        ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\ta\n"
+        ".x.com\tTRUE\t/\tTRUE\t0\tct0\tb"
     )
     assert parse_cookie_text(text) == {"auth_token": "a", "ct0": "b"}
 

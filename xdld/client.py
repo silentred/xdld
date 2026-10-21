@@ -80,10 +80,25 @@ async def check_session(client, retries: int = 3, delay: float = 2.0) -> Session
             False, detail="cookies rejected by X - export a fresh cookie jar"
         )
 
-    try:
-        user = await client.user()
-    except Exception as exc:  # noqa: BLE001 - any failure means "not usable"
-        return SessionInfo(True, detail=f"logged in, but /me failed: {exc}")
+    user = None
+    last: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            user = await client.user()
+            last = None
+            break
+        except Exception as exc:  # noqa: BLE001 - any failure means "not usable"
+            last = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(delay)
+    if user is None:
+        return SessionInfo(
+            False,
+            detail=(
+                f"logged in, but the account could not be read: "
+                f"{type(last).__name__}: {last}"
+            ),
+        )
 
     return SessionInfo(
         True,
@@ -97,7 +112,17 @@ async def check_session(client, retries: int = 3, delay: float = 2.0) -> Session
 async def resolve_user_id(client, screen_name: str | None) -> tuple[str, str]:
     """Return ``(user_id, screen_name)`` for the target account."""
     if not screen_name:
-        user = await client.user()
+        try:
+            user = await client.user()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read the logged-in account: {type(exc).__name__}: {exc}"
+            ) from exc
+        if user is None or user.id is None:
+            raise RuntimeError(
+                "X did not return an account id - the session is incomplete, "
+                "export a fresh cookie jar"
+            )
         return str(user.id), user.screen_name
 
     user = await client.get_user_by_screen_name(screen_name)

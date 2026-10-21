@@ -11,12 +11,14 @@ from pathlib import Path
 
 from xdld.client import build_client, check_session, resolve_user_id
 from xdld.config import Config
+from xdld.diag import describe_exception, hints
 from xdld.download import DownloadError, download_file, download_hls_async
 from xdld.likes import LikesOptions, WalkState, iter_likes
 from xdld.media import (
     HLS,
     IMAGE,
     MediaItem,
+    Variant,
     best_variant,
     extract_media,
     image_extension,
@@ -106,6 +108,106 @@ def _media_key(tweet_id: str, item: MediaItem, index: int) -> str:
     return item.media_id or f"{tweet_id}:{index}"
 
 
+@dataclass
+class MediaCandidate:
+    """One downloadable file of a tweet."""
+
+    item: MediaItem
+    variant: Variant | None
+    index: int
+    key: str
+    url: str
+    ext: str
+    filename: str
+    dest: Path
+    is_image: bool
+
+
+@dataclass
+class TweetCandidate:
+    """A tweet and everything we could download from it."""
+
+    tweet_id: str
+    author: str
+    created_at: str
+    tweet: object
+    media: list[MediaCandidate] = field(default_factory=list)
+    has_video: bool = False
+
+
+def build_tweet_candidates(
+    cfg: Config,
+    tweet,
+    out_dir: Path,
+    download_images: bool | None = None,
+) -> TweetCandidate:
+    """Pick the files of a tweet: the best variant of every video.
+
+    Shared by ``xdld run`` and ``xdld export`` so both agree on the file
+    name, the url and the target path.
+    """
+    if download_images is None:
+        download_images = cfg.download_images
+
+    tweet_id = str(tweet.id)
+    author = _tweet_author(tweet)
+    created = _tweet_created(tweet)
+    items = extract_media(tweet)
+    video_items = [i for i in items if i.kind in ("video", "gif")]
+
+    candidates: list[MediaCandidate] = []
+    for index, item in enumerate(items):
+        is_image = item.kind == IMAGE
+        if is_image and not download_images:
+            continue
+        if not is_image and item.kind not in ("video", "gif"):
+            continue
+
+        variant = None if is_image else best_variant(item)
+        if not is_image and variant is None:
+            continue
+
+        url = item.image_url if is_image else variant.url
+        ext = (
+            image_extension(item.image_url)
+            if is_image
+            else (variant.ext if variant else ".mp4")
+        )
+        filename = render_filename(
+            cfg.filename_template,
+            {
+                "tweet_id": tweet_id,
+                "user": author,
+                "index": index,
+                "ext": ext,
+                "date": (created[:10] if created else ""),
+                "media_id": item.media_id,
+            },
+        )
+        candidates.append(
+            MediaCandidate(
+                item=item,
+                variant=variant,
+                index=index,
+                key=_media_key(tweet_id, item, index),
+                url=url,
+                ext=ext,
+                filename=filename,
+                dest=out_dir / filename,
+                is_image=is_image,
+            )
+        )
+
+    return TweetCandidate(
+        tweet_id=tweet_id,
+        author=author,
+        created_at=created,
+        tweet=tweet,
+        media=candidates,
+        has_video=bool(video_items),
+    )
+
+
 async def run_download(
     cfg: Config,
     screen_name: str | None = None,
@@ -114,6 +216,7 @@ async def run_download(
     since_tweet: str | None = None,
     from_page: int | None = None,
     quiet: bool = False,
+    verbose: bool = False,
     log=print,
 ) -> RunStats:
     stats = RunStats()
@@ -154,21 +257,20 @@ async def run_download(
         async for tweet in iter_likes(
             client, user_id, opts, store, log=progress.note, state=state
         ):
-            tweet_id = str(tweet.id)
+            cand = build_tweet_candidates(cfg, tweet, out_dir)
+            tweet_id = cand.tweet_id
             stats.tweets_seen += 1
-            author = _tweet_author(tweet)
-            created = _tweet_created(tweet)
+            author = cand.author
+            created = cand.created_at
 
-            items = extract_media(tweet)
-            video_items = [i for i in items if i.kind in ("video", "gif")]
-            if video_items:
+            if cand.has_video:
                 stats.tweets_with_video += 1
 
             store.record_tweet(
                 tweet_id,
                 author=author,
                 created_at=created,
-                has_video=bool(video_items),
+                has_video=cand.has_video,
             )
             progress.counter(
                 tweets=stats.tweets_seen,
@@ -179,38 +281,16 @@ async def run_download(
                 size=human_bytes(stats.bytes),
             )
 
-            for index, item in enumerate(items):
-                is_image = item.kind == IMAGE
-                if is_image and not cfg.download_images:
-                    continue
-                if not is_image and item.kind not in ("video", "gif"):
-                    continue
-
-                variant = None if is_image else best_variant(item)
-                if not is_image and variant is None:
-                    continue
+            for media in cand.media:
+                item = media.item
+                variant = media.variant
+                is_image = media.is_image
 
                 stats.candidates += 1
-                key = _media_key(tweet_id, item, index)
-                url = item.image_url if is_image else variant.url
-                ext = (
-                    image_extension(item.image_url)
-                    if is_image
-                    else (variant.ext if variant else ".mp4")
-                )
-
-                filename = render_filename(
-                    cfg.filename_template,
-                    {
-                        "tweet_id": tweet_id,
-                        "user": author,
-                        "index": index,
-                        "ext": ext,
-                        "date": (created[:10] if created else ""),
-                        "media_id": item.media_id,
-                    },
-                )
-                dest = out_dir / filename
+                key = media.key
+                url = media.url
+                filename = media.filename
+                dest = media.dest
 
                 status = store.media_status(key)
                 if status == "done":
@@ -222,10 +302,38 @@ async def run_download(
                         )
                         continue
                     progress.note(f"redo  {tweet_id} (previous file is gone)")
+                elif dest.exists() and not cfg.overwrite:
+                    # The file is on disk but the state does not know it (the
+                    # database was deleted, a different machine, ...). Files are
+                    # renamed into place atomically, so an existing one is
+                    # complete - register it instead of downloading it again.
+                    size = dest.stat().st_size
+                    store.record_media(
+                        key,
+                        tweet_id,
+                        item.media_id,
+                        item.kind,
+                        url,
+                        status="done",
+                        path=str(dest),
+                        size=size,
+                    )
+                    stats.skipped += 1
+                    stats.bytes += size
+                    progress.note(f"skip  {tweet_id} (already on disk: {filename})")
+                    continue
 
                 if dry_run:
                     progress.note(f"plan  {tweet_id} -> {filename}  ({url})")
                     continue
+
+                if verbose:
+                    progress.note(
+                        f"get   {tweet_id} {item.kind} "
+                        f"{item.width}x{item.height} "
+                        f"{variant.content_type if variant else ''} "
+                        f"bitrate={variant.bitrate if variant else '-'}"
+                    )
 
                 progress.file_start(filename)
                 try:
@@ -278,6 +386,10 @@ async def run_download(
                     )
                     progress.file_end()
                     progress.note(f"FAIL  {message}")
+                    if verbose:
+                        progress.note(describe_exception(exc))
+                        for hint in hints(exc):
+                            progress.note(f"      hint: {hint}")
                     continue
                 finally:
                     progress.file_end()

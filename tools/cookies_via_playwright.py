@@ -2,7 +2,8 @@
 """Export x.com cookies without a browser extension.
 
 Opens a real Chromium window, waits until you log in by hand, then writes
-``cookies.json`` (the format ``xdld`` understands) next to this script.
+``cookies.txt`` (the Netscape format every browser extension exports and the
+format ``xdld`` understands) next to this script.
 
     .venv/bin/pip install playwright
     .venv/bin/playwright install chromium
@@ -16,13 +17,34 @@ local file, they are never sent anywhere else.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-OUT = Path(__file__).resolve().parent.parent / "cookies.json"
+OUT = Path(__file__).resolve().parent.parent / "cookies.txt"
+
+HEADER = (
+    "# Netscape HTTP Cookie File\n"
+    "# https://curl.haxx.se/rfc/cookie_spec.html\n"
+    "# This is a generated file! Do not edit.\n"
+)
+
+
+def _netscape(cookies: list[dict]) -> str:
+    """Render the cookies in the Netscape cookies.txt format."""
+    lines = [HEADER]
+    for c in cookies:
+        domain = c.get("domain", "")
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        path = c.get("path", "/")
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        expires = int(c.get("expires") or 0)
+        lines.append(
+            f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t"
+            f"{c['name']}\t{c['value']}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 async def main() -> int:
@@ -54,16 +76,7 @@ async def main() -> int:
         print("\nLogin did not finish - no auth_token/ct0 in the cookie jar.")
         return 1
 
-    OUT.write_text(
-        json.dumps(
-            [
-                {"name": c["name"], "value": c["value"], "domain": c["domain"]}
-                for c in cookies
-            ],
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    OUT.write_text(_netscape(cookies), encoding="utf-8")
     print(f"\nWrote {len(cookies)} cookies to {OUT}")
     print("Next: .venv/bin/xdld check")
     return 0

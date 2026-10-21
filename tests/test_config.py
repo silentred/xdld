@@ -56,12 +56,12 @@ def test_config_paths_resolve_against_the_config_file_dir(tmp_path):
     """A relative path in xdld.toml belongs next to xdld.toml."""
     cfg_dir = tmp_path / "project"
     cfg_dir.mkdir()
-    (cfg_dir / "xdld.toml").write_text('cookies = "cookies.json"\n', encoding="utf-8")
+    (cfg_dir / "xdld.toml").write_text('cookies = "cookies.txt"\n', encoding="utf-8")
     other = tmp_path / "elsewhere"
     other.mkdir()
 
     cfg = load_config(str(cfg_dir / "xdld.toml"), base_dir=str(other))
-    assert cfg.cookies == str((cfg_dir / "cookies.json").resolve())
+    assert cfg.cookies == str((cfg_dir / "cookies.txt").resolve())
 
 
 def test_cli_paths_resolve_against_the_cwd(tmp_path):

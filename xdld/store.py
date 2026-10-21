@@ -140,6 +140,26 @@ class Store:
         ).fetchone()
         return row["path"] if row else None
 
+    def find_media_key(
+        self, url: str | None = None, path: str | None = None
+    ) -> str | None:
+        """Look a media up by its url or by its local path."""
+        if url:
+            row = self.conn.execute(
+                "SELECT media_key FROM media WHERE url = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (url,),
+            ).fetchone()
+            if row:
+                return row["media_key"]
+        if path:
+            row = self.conn.execute(
+                "SELECT media_key FROM media WHERE path = ? LIMIT 1", (path,)
+            ).fetchone()
+            if row:
+                return row["media_key"]
+        return None
+
     # ------------------------------------------------------------------- state
     def set_state(self, key: str, value: str) -> None:
         self.conn.execute(
