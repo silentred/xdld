@@ -63,6 +63,7 @@ class WalkState:
     pages_walked: int = 0
     skipped: int = 0  # tweets before the start point
     start_found: bool = True
+    current_page: int = 0  # the page of the tweet that was yielded last
 
 
 async def _next_page(client, user_id: str, opts: LikesOptions, result):
@@ -148,6 +149,9 @@ async def iter_likes(
                     return
             else:
                 consecutive_known = 0
+
+            if state is not None:
+                state.current_page = page
 
             yield tweet
             produced += 1

@@ -305,7 +305,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_likes(args: argparse.Namespace) -> int:
     from xdld.client import build_client, check_session, resolve_user_id
     from xdld.diag import describe_exception, hints
-    from xdld.likes import LikesOptions, iter_likes
+    from xdld.likes import LikesOptions, WalkState, iter_likes
     from xdld.media import best_variant, extract_media
     from xdld.progress import Progress
 
@@ -331,13 +331,17 @@ def cmd_likes(args: argparse.Namespace) -> int:
             from_page=getattr(args, "from_page", None) or cfg.from_page,
         )
         count = 0
+        state = WalkState()
         try:
-            async for tweet in iter_likes(client, user_id, opts, log=progress.note):
+            async for tweet in iter_likes(
+                client, user_id, opts, log=progress.note, state=state
+            ):
                 count += 1
                 user = getattr(tweet, "user", None)
                 author = getattr(user, "screen_name", "") if user else ""
                 progress.note(
-                    f"[{count}] {tweet.id} @{author} - {(tweet.text or '')[:100]!r}"
+                    f"[{count}] page {state.current_page} {tweet.id} "
+                    f"@{author} - {(tweet.text or '')[:100]!r}"
                 )
                 progress.counter(tweets=count)
                 if args.media:
@@ -402,7 +406,7 @@ def cmd_refresh_ops(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     """Write an aria2c input file with every video that is still missing."""
     from xdld.client import build_client, check_session, resolve_user_id
-    from xdld.likes import LikesOptions, iter_likes
+    from xdld.likes import LikesOptions, WalkState, iter_likes
     from xdld.manifest import ManifestEntry, write_manifest
     from xdld.progress import Progress
     from xdld.runner import build_tweet_candidates
@@ -458,8 +462,12 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
 
         with Store(cfg.db) as store:
-            async for tweet in iter_likes(client, user_id, opts, store, log=progress.note):
+            state = WalkState()
+            async for tweet in iter_likes(
+                client, user_id, opts, store, log=progress.note, state=state
+            ):
                 cand = build_tweet_candidates(cfg, tweet, target_dir)
+                page = state.current_page
                 for media in cand.media:
                     status = store.media_status(media.key)
                     if status == "done":
@@ -489,6 +497,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                             kind=media.item.kind,
                             author=cand.author,
                             created_at=cand.created_at,
+                            page=page,
                         )
                     )
 
@@ -499,6 +508,12 @@ def cmd_export(args: argparse.Namespace) -> int:
     print(f"manifest: {manifest_path}  ({len(entries)} file(s), {skipped} skipped)")
     print(f"download: aria2c -c -x 4 -s 4 -j 4 -i {manifest_path}")
     print(f"record  : xdld record -i {manifest_path}")
+    if entries:
+        last = entries[-1]
+        print(f"last    : tweet {last.tweet_id} (page {last.page})")
+        print(f"next    : xdld export --since-tweet {last.tweet_id}")
+        if last.page:
+            print(f"          xdld export --from-page {last.page}")
     return 0
 
 
@@ -525,6 +540,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     recorded = 0
     missing = 0
     unknown = 0
+    last: object | None = None
     with Store(cfg.db) as store:
         for entry in entries:
             target = entry.path
@@ -533,6 +549,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             if not exists and not args.assume_done:
                 missing += 1
                 print(f"missing: {target}")
+                last = entry
                 continue
             key = entry.media_id or store.find_media_key(
                 url=entry.url, path=str(target)
@@ -540,6 +557,7 @@ def cmd_record(args: argparse.Namespace) -> int:
             if not key:
                 unknown += 1
                 print(f"unknown: {entry.url} (no media id in the manifest)")
+                last = entry
                 continue
             store.record_media(
                 key,
@@ -559,6 +577,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                     has_video=True,
                 )
             recorded += 1
+            last = entry
 
     print(
         f"recorded: {recorded} file(s)"
@@ -566,6 +585,15 @@ def cmd_record(args: argparse.Namespace) -> int:
         + (f", unknown: {unknown}" if unknown else "")
     )
     print("the next `xdld export` will not list them again")
+    if last is not None and last.tweet_id:
+        page = last.page
+        where = f"tweet {last.tweet_id}"
+        if page:
+            where += f" (page {page})"
+        print(f"last    : {where}")
+        print(f"next    : xdld export --since-tweet {last.tweet_id}")
+        if page:
+            print(f"          xdld export --from-page {page}")
     return 0
 
 

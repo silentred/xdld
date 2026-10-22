@@ -131,3 +131,17 @@ def test_aria2c_downloads_the_file_to_the_given_path(tmp_path):
     downloaded = target_dir / "111_alice_0.mp4"
     assert downloaded.exists()
     assert downloaded.read_bytes() == payload
+
+
+def test_manifest_keeps_the_page():
+    entry = _entry()
+    entry.page = 7
+    text = render_manifest([entry])
+    assert '"page": 7' in text
+    parsed = parse_manifest(text)
+    assert parsed[0].page == 7
+
+
+def test_manifest_without_a_page_is_zero():
+    text = render_manifest([_entry()])
+    assert parse_manifest(text)[0].page == 0

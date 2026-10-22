@@ -52,6 +52,7 @@ class ManifestEntry:
     kind: str = "video"
     author: str = ""
     created_at: str = ""
+    page: int = 0  # the page of the likes timeline this tweet lives on
     extra: dict = field(default_factory=dict)
 
     @property
@@ -75,7 +76,15 @@ class ManifestEntry:
             "author": self.author,
             "created_at": self.created_at,
             "url": self.url,
+            "page": self.page,
         }
+
+
+def _as_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def render_manifest(
@@ -171,6 +180,7 @@ def parse_manifest(text: str) -> list[ManifestEntry]:
             kind=str(meta.get("kind", "video")),
             author=str(meta.get("author", "")),
             created_at=str(meta.get("created_at", "")),
+            page=_as_int(meta.get("page")),
         )
         entries.append(current)
 

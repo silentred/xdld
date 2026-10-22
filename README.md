@@ -190,6 +190,19 @@ aria2c -c -x 4 -s 4 -j 4 -i downloads/aria2.txt
 .venv/bin/xdld export --limit 100
 ```
 
+`export` 和 `record` 都会告诉你**这一轮的最后一条**（哪条推文、在第几页），直接拿它接下一轮：
+
+```text
+last    : tweet 2110697847708586048 (page 2)
+next    : xdld export --since-tweet 2110697847708586048
+          xdld export --from-page 2
+```
+
+* `--since-tweet <id>`：从这条（含这条）开始往更老的推文走，**推荐**，不受你新点赞的影响。
+* `--from-page <N>`：从第 N 页开始（第 1 页 = 最新），会重新走一遍这一页，但已下载的会自动跳过。
+* 页码是导出当时的时间线页码（每页 40 条），清单位于 `xdld.toml` 的 `page_size`。
+* `xdld likes --limit 100` 也会逐条打印 `page N`，可以直接看到某条推文在第几页。
+
 清单长这样（aria2c 输入文件格式：URI 一行，接下来的行是这条 URI 的选项，必须缩进）：
 
 ```
@@ -214,7 +227,7 @@ https://video.twimg.com/amplify_video/2112018771363971072/vid/avc1/1280x718/WZ_G
 
 * **输出文件名带 tweet id**：`out=2112022615082832063_EasonnLl_0.mp4`，文件名模板可以用 `--template` 改（可用占位符：`{tweet_id} {user} {index} {ext} {date} {media_id}`）。
 * **`dir=` 是绝对路径**，aria2c 会把文件放到那里；`--dir` 可以把下载目录换成别的。
-* **`# xdld-meta` 注释里存了元数据**（tweet_id / media_id / 作者 / 时间），`xdld record` 就是靠它把下载结果写回数据库的。注释对 aria2c 无影响。
+* **`# xdld-meta` 注释里存了元数据**（tweet_id / media_id / 作者 / 时间 / 页码），`xdld record` 就是靠它把下载结果写回数据库的。注释对 aria2c 无影响。
 * `xdld record` 会检查文件是否真的存在，缺失的会列出来（`missing: ...`），不会误标记；确实想要“不管在不在都记上”可以加 `--assume-done`。
 * `xdld record -i -` 可以从标准输入读清单。
 
@@ -271,7 +284,7 @@ xdld/
 │   ├── store.py      # SQLite 去重 / 状态
 │   ├── discover.py   # 404 时自动找回 GraphQL query id
 │   └── runner.py     # 主流程编排
-└── tests/            # pytest（72 个用例，mock 掉 X 客户端）
+└── tests/            # pytest（76 个用例，mock 掉 X 客户端）
 ```
 
 ---
