@@ -121,3 +121,42 @@ def test_run_passes_the_start_point_to_the_runner(monkeypatch, tmp_path):
     assert seen["from_page"] == 2
     assert seen["limit"] == 5
     assert seen["dry_run"] is True
+
+
+def test_max_size_is_read_as_a_number_of_bytes():
+    parser = cli.build_parser()
+    args = parser.parse_args(["run", "--max-size", "50MB"])
+    assert args.max_size == 50 * 1024 * 1024
+
+    args = parser.parse_args(["export", "--max-size", "1.5GB"])
+    assert args.max_size == int(1.5 * 1024**3)
+
+    args = parser.parse_args(["likes", "--max-size", "0"])
+    assert args.max_size == 0
+
+
+def test_a_broken_max_size_is_reported():
+    parser = cli.build_parser()
+    try:
+        parser.parse_args(["run", "--max-size", "50 potatoes"])
+    except SystemExit:
+        return
+    raise AssertionError("expected the parser to reject the size")
+
+
+def test_the_max_size_reaches_the_config(monkeypatch, tmp_path):
+    from xdld import runner as runner_mod
+
+    seen = {}
+
+    async def fake_run_download(cfg, **kwargs):
+        seen["max_size"] = cfg.max_size
+        return runner_mod.RunStats()
+
+    monkeypatch.setattr(runner_mod, "run_download", fake_run_download)
+
+    args = cli.build_parser().parse_args(
+        ["run", "--config", str(tmp_path / "no.toml"), "--max-size", "25MB"]
+    )
+    assert cli.cmd_run(args) == 0
+    assert seen["max_size"] == 25 * 1024 * 1024

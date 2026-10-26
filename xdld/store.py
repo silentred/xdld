@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS state (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+
+-- The sizes we measured on the CDN. The files never change, so a size that
+-- was looked up once stays valid.
+CREATE TABLE IF NOT EXISTS file_sizes (
+    url        TEXT PRIMARY KEY,
+    bytes      INTEGER,
+    checked_at TEXT
+);
 """
 
 
@@ -159,6 +167,26 @@ class Store:
             if row:
                 return row["media_key"]
         return None
+
+    # ------------------------------------------------------------------ sizes
+    def known_size(self, url: str) -> int | None:
+        """The size we measured for this url earlier (None if unknown)."""
+        row = self.conn.execute(
+            "SELECT bytes FROM file_sizes WHERE url = ?", (url,)
+        ).fetchone()
+        if not row or not row["bytes"]:
+            return None
+        return int(row["bytes"])
+
+    def remember_size(self, url: str, size: int) -> None:
+        """Remember the size of a url so we do not ask the CDN again."""
+        self.conn.execute(
+            "INSERT INTO file_sizes (url, bytes, checked_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET bytes = excluded.bytes, "
+            "checked_at = excluded.checked_at",
+            (url, int(size), _now()),
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------- state
     def set_state(self, key: str, value: str) -> None:

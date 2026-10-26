@@ -146,6 +146,40 @@ def test_record_marks_the_manifest_as_downloaded(monkeypatch, tmp_path):
         assert store.media_path("m1").endswith("111_alice_0.mp4")
 
 
+def test_export_respects_the_size_limit(monkeypatch, tmp_path):
+    """With --max-size the manifest lists the variant that fits."""
+    _patch(monkeypatch, [FakeTweet()])
+
+    async def fake_remote_size(url, proxy=None, timeout=30.0, **kwargs):
+        return {
+            "https://v/high.mp4": 60 * 1024 * 1024,
+            "https://v/low.mp4": 8 * 1024 * 1024,
+        }.get(url)
+
+    monkeypatch.setattr("xdld.sizes.remote_size", fake_remote_size)
+
+    manifest = tmp_path / "aria2.txt"
+    args = cli.build_parser().parse_args(
+        [
+            "export",
+            "--config",
+            str(tmp_path / "no.toml"),
+            "--out",
+            str(tmp_path / "dl"),
+            "--db",
+            str(tmp_path / "s.db"),
+            "--max-size",
+            "20MB",
+            "-o",
+            str(manifest),
+        ]
+    )
+    assert cli.cmd_export(args) == 0
+    text = manifest.read_text()
+    assert "https://v/low.mp4" in text
+    assert "https://v/high.mp4" not in text
+
+
 def test_export_skips_what_is_already_recorded(monkeypatch, tmp_path):
     _patch(monkeypatch, [FakeTweet()])
     dl = tmp_path / "dl"

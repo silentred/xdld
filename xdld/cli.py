@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from xdld.config import DEFAULT_CONFIG_NAME, load_config
+from xdld.config import DEFAULT_CONFIG_NAME, load_config, parse_size
 from xdld.cookies import CookieError
 
 SAMPLE_CONFIG = """\
@@ -47,6 +47,22 @@ from_page = 1
 # Also download images (off by default).
 download_images = false
 
+# The biggest file we are willing to download ("50MB", "1.5GB", 0 == no limit).
+# With a limit the best video variant that still fits into it is downloaded
+# instead of the one with the highest resolution.
+max_size = "0"
+
+# What to do when not even the smallest variant fits into max_size:
+#   false (default) -> download the smallest one anyway
+#   true            -> skip the video, the limit is a hard rule then
+max_size_strict = false
+
+# Measure the real size of a variant before downloading it (one small
+# request per variant, the answer is remembered in the database).
+# When it is off the size is estimated from the bitrate, which is about
+# twice too big - the limit is then roughly half as big as it looks.
+max_size_probe = true
+
 # {tweet_id} {user} {index} {ext} {date} {media_id}
 filename_template = "{tweet_id}_{user}_{index}{ext}"
 
@@ -62,6 +78,45 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", dest="output_dir", help="output directory")
     parser.add_argument("--db", help="path to the sqlite state file")
     parser.add_argument("-v", "--verbose", action="store_true", help="more output")
+
+
+def _size_arg(value: str) -> int:
+    """``--max-size 50MB`` -> a number of bytes."""
+    try:
+        return parse_size(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _add_max_size(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-size",
+        type=_size_arg,
+        metavar="SIZE",
+        help=(
+            "download the best video variant that fits into SIZE "
+            '(e.g. 50MB, 1.5GB; 0 == no limit)'
+        ),
+    )
+    parser.add_argument(
+        "--max-size-strict",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "skip a video when not even its smallest variant fits into "
+            "--max-size (by default the smallest one is downloaded anyway)"
+        ),
+    )
+    parser.add_argument(
+        "--max-size-probe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "measure the real size of a variant before downloading it "
+            "(one small request per variant); when it is off the size is "
+            "estimated from the bitrate"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--template", help="filename template")
     p_run.add_argument("--impersonate", help="browser TLS fingerprint, e.g. chrome124")
     p_run.add_argument("--page-size", type=int, help="tweets per API page")
+    _add_max_size(p_run)
     p_run.add_argument("--stop-after-known", type=int, help="stop after N known tweets in a row")
     p_run.add_argument("--sleep", nargs=2, type=float, metavar=("MIN", "MAX"), help="pause between pages")
     p_run.add_argument(
@@ -109,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_likes.add_argument("--user", help="screen name to walk (default: the logged-in account)")
     p_likes.add_argument("--limit", type=int, help="stop after N liked tweets")
     p_likes.add_argument("--media", action="store_true", help="show the media candidates")
+    _add_max_size(p_likes)
     p_likes.add_argument(
         "--since-tweet", metavar="TWEET_ID", help="start at this tweet (inclusive)"
     )
@@ -136,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--images", action="store_true", help="also export images")
     p_export.add_argument("--template", help="filename template")
     p_export.add_argument("--page-size", type=int, help="tweets per API page")
+    _add_max_size(p_export)
     p_export.add_argument(
         "--stop-after-known", type=int, help="stop after N known tweets in a row"
     )
@@ -274,6 +332,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         overrides["sleep_min"], overrides["sleep_max"] = args.sleep
     if getattr(args, "from_page", None):
         overrides["from_page"] = args.from_page
+    overrides.update(_size_override(args))
 
     cfg = load_config(args.config, overrides=overrides)
     if verbose:
@@ -306,11 +365,14 @@ def cmd_likes(args: argparse.Namespace) -> int:
     from xdld.client import build_client, check_session, resolve_user_id
     from xdld.diag import describe_exception, hints
     from xdld.likes import LikesOptions, WalkState, iter_likes
-    from xdld.media import best_variant, extract_media
-    from xdld.progress import Progress
+    from xdld.media import extract_media, select_variant
+    from xdld.progress import Progress, human_bytes
+    from xdld.sizes import SizeProbe
 
     verbose = getattr(args, "verbose", False)
-    cfg = load_config(args.config, overrides=_overrides(args))
+    overrides = _overrides(args)
+    overrides.update(_size_override(args))
+    cfg = load_config(args.config, overrides=overrides)
     progress = Progress(log=print)
 
     async def _run() -> int:
@@ -332,6 +394,9 @@ def cmd_likes(args: argparse.Namespace) -> int:
         )
         count = 0
         state = WalkState()
+        probe = SizeProbe(proxy=cfg.proxy)
+        if not cfg.max_size_probe:
+            probe = None
         try:
             async for tweet in iter_likes(
                 client, user_id, opts, log=progress.note, state=state
@@ -346,12 +411,38 @@ def cmd_likes(args: argparse.Namespace) -> int:
                 progress.counter(tweets=count)
                 if args.media:
                     for item in extract_media(tweet):
-                        variant = best_variant(item)
+                        if item.kind == "image":
+                            size = 0
+                            if cfg.max_size and probe is not None:
+                                size = await probe(item.image_url) or 0
+                            print(
+                                f"      {item.kind} {item.media_id} "
+                                f"{item.width}x{item.height}"
+                                + (f" size={human_bytes(size)}" if size else "")
+                            )
+                            continue
+                        variant, size = await select_variant(
+                            item,
+                            cfg.max_size,
+                            probe=probe,
+                            strict=cfg.max_size_strict,
+                        )
                         if variant:
+                            note = ""
+                            if cfg.max_size and size > cfg.max_size:
+                                note = "  (over the limit, smallest one)"
                             print(
                                 f"      {item.kind} {item.media_id} "
                                 f"{item.width}x{item.height} "
                                 f"{variant.content_type} bitrate={variant.bitrate}"
+                                + (f" size={human_bytes(size)}" if size else "")
+                                + note
+                            )
+                        elif cfg.max_size:
+                            print(
+                                f"      {item.kind} {item.media_id} "
+                                f"{item.width}x{item.height} "
+                                f"(nothing fits into {human_bytes(cfg.max_size)})"
                             )
                         else:
                             print(
@@ -410,6 +501,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     from xdld.manifest import ManifestEntry, write_manifest
     from xdld.progress import Progress
     from xdld.runner import build_tweet_candidates
+    from xdld.sizes import SizeProbe
     from xdld.store import Store
 
     overrides = _overrides(args)
@@ -423,6 +515,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         overrides["stop_after_known"] = args.stop_after_known
     if getattr(args, "sleep", None):
         overrides["sleep_min"], overrides["sleep_max"] = args.sleep
+    overrides.update(_size_override(args))
 
     cfg = load_config(args.config, overrides=overrides)
     out_dir = Path(cfg.output_dir)
@@ -463,10 +556,13 @@ def cmd_export(args: argparse.Namespace) -> int:
 
         with Store(cfg.db) as store:
             state = WalkState()
+            probe = SizeProbe(proxy=cfg.proxy, store=store)
             async for tweet in iter_likes(
                 client, user_id, opts, store, log=progress.note, state=state
             ):
-                cand = build_tweet_candidates(cfg, tweet, target_dir)
+                cand = await build_tweet_candidates(
+                    cfg, tweet, target_dir, probe=probe, log=progress.note
+                )
                 page = state.current_page
                 for media in cand.media:
                     status = store.media_status(media.key)
@@ -498,6 +594,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                             author=cand.author,
                             created_at=cand.created_at,
                             page=page,
+                            size=media.size,
                         )
                     )
 
@@ -617,6 +714,21 @@ def _overrides(args: argparse.Namespace) -> dict:
         value = getattr(args, name, None)
         if value:
             out[name] = value
+    return out
+
+
+def _size_override(args: argparse.Namespace) -> dict:
+    """``--max-size`` (already in bytes) overrides the config file."""
+    out = {}
+    value = getattr(args, "max_size", None)
+    if value is not None:
+        out["max_size"] = value
+    strict = getattr(args, "max_size_strict", None)
+    if strict is not None:
+        out["max_size_strict"] = strict
+    probe = getattr(args, "max_size_probe", None)
+    if probe is not None:
+        out["max_size_probe"] = probe
     return out
 
 

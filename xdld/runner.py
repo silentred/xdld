@@ -19,11 +19,12 @@ from xdld.media import (
     IMAGE,
     MediaItem,
     Variant,
-    best_variant,
     extract_media,
     image_extension,
+    select_variant,
 )
 from xdld.progress import Progress, human_bytes, with_heartbeat
+from xdld.sizes import SizeProbe
 from xdld.store import Store
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -75,6 +76,7 @@ class RunStats:
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
+    too_large: int = 0
     bytes: int = 0
     skipped_start: int = 0
     errors: list[str] = field(default_factory=list)
@@ -87,6 +89,7 @@ class RunStats:
             "downloaded": self.downloaded,
             "skipped": self.skipped,
             "failed": self.failed,
+            "too_large": self.too_large,
             "bytes": self.bytes,
         }
         if self.skipped_start:
@@ -121,6 +124,7 @@ class MediaCandidate:
     filename: str
     dest: Path
     is_image: bool
+    size: int = 0  # known size of the file (0 == unknown)
 
 
 @dataclass
@@ -133,18 +137,22 @@ class TweetCandidate:
     tweet: object
     media: list[MediaCandidate] = field(default_factory=list)
     has_video: bool = False
+    too_large: int = 0  # videos skipped because of the size limit
 
 
-def build_tweet_candidates(
+async def build_tweet_candidates(
     cfg: Config,
     tweet,
     out_dir: Path,
     download_images: bool | None = None,
+    probe: SizeProbe | None = None,
+    log=None,
 ) -> TweetCandidate:
     """Pick the files of a tweet: the best variant of every video.
 
     Shared by ``xdld run`` and ``xdld export`` so both agree on the file
-    name, the url and the target path.
+    name, the url and the target path. With ``cfg.max_size`` set the best
+    variant that fits into the limit is taken instead of the biggest one.
     """
     if download_images is None:
         download_images = cfg.download_images
@@ -156,6 +164,7 @@ def build_tweet_candidates(
     video_items = [i for i in items if i.kind in ("video", "gif")]
 
     candidates: list[MediaCandidate] = []
+    too_large = 0
     for index, item in enumerate(items):
         is_image = item.kind == IMAGE
         if is_image and not download_images:
@@ -163,16 +172,47 @@ def build_tweet_candidates(
         if not is_image and item.kind not in ("video", "gif"):
             continue
 
-        variant = None if is_image else best_variant(item)
-        if not is_image and variant is None:
-            continue
+        variant = None
+        url = item.image_url
+        ext = image_extension(item.image_url)
+        size = 0
+        if not is_image:
+            variant, size = await select_variant(
+                item,
+                cfg.max_size,
+                probe=probe,
+                log=log,
+                strict=cfg.max_size_strict,
+            )
+            if variant is None:
+                if cfg.max_size:
+                    too_large += 1
+                continue
+            url = variant.url
+            ext = variant.ext
+        elif cfg.max_size and probe is not None:
+            # An image has no variants: either it fits or it is skipped.
+            size = await probe.size(url) or 0
+            if size and size > cfg.max_size:
+                if item.thumb_url:
+                    thumb_size = await probe.size(item.thumb_url) or 0
+                    if thumb_size and thumb_size <= cfg.max_size:
+                        url = item.thumb_url
+                        ext = image_extension(url)
+                        size = thumb_size
+                    elif cfg.max_size_strict:
+                        too_large += 1
+                        continue
+                    else:
+                        # Not even the small version fits: take it anyway,
+                        # a picture is not thrown away because of its size.
+                        url = item.thumb_url
+                        ext = image_extension(url)
+                        size = thumb_size
+                elif cfg.max_size_strict:
+                    too_large += 1
+                    continue
 
-        url = item.image_url if is_image else variant.url
-        ext = (
-            image_extension(item.image_url)
-            if is_image
-            else (variant.ext if variant else ".mp4")
-        )
         filename = render_filename(
             cfg.filename_template,
             {
@@ -195,6 +235,7 @@ def build_tweet_candidates(
                 filename=filename,
                 dest=out_dir / filename,
                 is_image=is_image,
+                size=size,
             )
         )
 
@@ -205,6 +246,7 @@ def build_tweet_candidates(
         tweet=tweet,
         media=candidates,
         has_video=bool(video_items),
+        too_large=too_large,
     )
 
 
@@ -254,60 +296,165 @@ async def run_download(
 
     with Store(cfg.db) as store:
         state = WalkState()
-        async for tweet in iter_likes(
-            client, user_id, opts, store, log=progress.note, state=state
-        ):
-            cand = build_tweet_candidates(cfg, tweet, out_dir)
-            tweet_id = cand.tweet_id
-            stats.tweets_seen += 1
-            author = cand.author
-            created = cand.created_at
+        async with SizeProbe(proxy=cfg.proxy, store=store) as probe:
+            # Without the probe the sizes are estimated from the bitrate:
+            # no request is made at all, but the limit is then only rough.
+            if not cfg.max_size_probe:
+                probe = None
+            async for tweet in iter_likes(
+                client, user_id, opts, store, log=progress.note, state=state
+            ):
+                cand = await build_tweet_candidates(
+                    cfg, tweet, out_dir, probe=probe, log=progress.note
+                )
+                tweet_id = cand.tweet_id
+                stats.tweets_seen += 1
+                author = cand.author
+                created = cand.created_at
 
-            if cand.has_video:
-                stats.tweets_with_video += 1
+                if cand.has_video:
+                    stats.tweets_with_video += 1
+                if cand.too_large:
+                    stats.too_large += cand.too_large
+                    progress.note(
+                        f"skip  {tweet_id} "
+                        f"({cand.too_large} video(s) above {human_bytes(cfg.max_size)})"
+                    )
 
-            store.record_tweet(
-                tweet_id,
-                author=author,
-                created_at=created,
-                has_video=cand.has_video,
-            )
-            progress.counter(
-                tweets=stats.tweets_seen,
-                videos=stats.tweets_with_video,
-                ok=stats.downloaded,
-                skip=stats.skipped,
-                fail=stats.failed,
-                size=human_bytes(stats.bytes),
-            )
+                store.record_tweet(
+                    tweet_id,
+                    author=author,
+                    created_at=created,
+                    has_video=cand.has_video,
+                )
+                progress.counter(
+                    tweets=stats.tweets_seen,
+                    videos=stats.tweets_with_video,
+                    ok=stats.downloaded,
+                    skip=stats.skipped,
+                    fail=stats.failed,
+                    size=human_bytes(stats.bytes),
+                )
 
-            for media in cand.media:
-                item = media.item
-                variant = media.variant
-                is_image = media.is_image
+                for media in cand.media:
+                    item = media.item
+                    variant = media.variant
+                    is_image = media.is_image
 
-                stats.candidates += 1
-                key = media.key
-                url = media.url
-                filename = media.filename
-                dest = media.dest
+                    stats.candidates += 1
+                    key = media.key
+                    url = media.url
+                    filename = media.filename
+                    dest = media.dest
 
-                status = store.media_status(key)
-                if status == "done":
-                    previous = store.media_path(key)
-                    if previous and Path(previous).exists():
-                        stats.skipped += 1
-                        progress.note(
-                            f"skip  {tweet_id} (already downloaded: {filename})"
+                    status = store.media_status(key)
+                    if status == "done":
+                        previous = store.media_path(key)
+                        if previous and Path(previous).exists() and not cfg.overwrite:
+                            stats.skipped += 1
+                            progress.note(
+                                f"skip  {tweet_id} (already downloaded: {filename})"
+                            )
+                            continue
+                        if not cfg.overwrite:
+                            progress.note(f"redo  {tweet_id} (previous file is gone)")
+                        else:
+                            progress.note(f"redo  {tweet_id} (--overwrite)")
+                    elif dest.exists() and not cfg.overwrite:
+                        # The file is on disk but the state does not know it (the
+                        # database was deleted, a different machine, ...). Files are
+                        # renamed into place atomically, so an existing one is
+                        # complete - register it instead of downloading it again.
+                        size = dest.stat().st_size
+                        store.record_media(
+                            key,
+                            tweet_id,
+                            item.media_id,
+                            item.kind,
+                            url,
+                            status="done",
+                            path=str(dest),
+                            size=size,
                         )
+                        stats.skipped += 1
+                        stats.bytes += size
+                        progress.note(f"skip  {tweet_id} (already on disk: {filename})")
                         continue
-                    progress.note(f"redo  {tweet_id} (previous file is gone)")
-                elif dest.exists() and not cfg.overwrite:
-                    # The file is on disk but the state does not know it (the
-                    # database was deleted, a different machine, ...). Files are
-                    # renamed into place atomically, so an existing one is
-                    # complete - register it instead of downloading it again.
-                    size = dest.stat().st_size
+
+                    if dry_run:
+                        progress.note(f"plan  {tweet_id} -> {filename}  ({url})")
+                        continue
+
+                    if verbose:
+                        progress.note(
+                            f"get   {tweet_id} {item.kind} "
+                            f"{item.width}x{item.height} "
+                            f"{variant.content_type if variant else ''} "
+                            f"bitrate={variant.bitrate if variant else '-'}"
+                            + (f" size={human_bytes(media.size)}" if media.size else "")
+                        )
+
+                    progress.file_start(filename)
+                    try:
+                        if is_image:
+                            size = await with_heartbeat(
+                                download_file(
+                                    url,
+                                    dest,
+                                    proxy=cfg.proxy,
+                                    overwrite=cfg.overwrite,
+                                    on_progress=progress.file_progress,
+                                    on_retry=progress.retry,
+                                ),
+                                progress,
+                                filename,
+                            )
+                        elif variant.kind == HLS:
+                            size = await with_heartbeat(
+                                download_hls_async(
+                                    url, dest, proxy=cfg.proxy, overwrite=cfg.overwrite
+                                ),
+                                progress,
+                                filename,
+                            )
+                        else:
+                            size = await with_heartbeat(
+                                download_file(
+                                    url,
+                                    dest,
+                                    proxy=cfg.proxy,
+                                    overwrite=cfg.overwrite,
+                                    on_progress=progress.file_progress,
+                                    on_retry=progress.retry,
+                                ),
+                                progress,
+                                filename,
+                            )
+                    except (DownloadError, Exception) as exc:  # noqa: BLE001
+                        stats.failed += 1
+                        message = f"{tweet_id}: {type(exc).__name__}: {exc}"
+                        stats.errors.append(message)
+                        store.record_media(
+                            key,
+                            tweet_id,
+                            item.media_id,
+                            item.kind,
+                            url,
+                            status="failed",
+                            error=str(exc),
+                        )
+                        progress.file_end()
+                        progress.note(f"FAIL  {message}")
+                        if verbose:
+                            progress.note(describe_exception(exc))
+                            for hint in hints(exc):
+                                progress.note(f"      hint: {hint}")
+                        continue
+                    finally:
+                        progress.file_end()
+
+                    stats.downloaded += 1
+                    stats.bytes += size
                     store.record_media(
                         key,
                         tweet_id,
@@ -318,123 +465,38 @@ async def run_download(
                         path=str(dest),
                         size=size,
                     )
-                    stats.skipped += 1
-                    stats.bytes += size
-                    progress.note(f"skip  {tweet_id} (already on disk: {filename})")
-                    continue
-
-                if dry_run:
-                    progress.note(f"plan  {tweet_id} -> {filename}  ({url})")
-                    continue
-
-                if verbose:
-                    progress.note(
-                        f"get   {tweet_id} {item.kind} "
-                        f"{item.width}x{item.height} "
-                        f"{variant.content_type if variant else ''} "
-                        f"bitrate={variant.bitrate if variant else '-'}"
-                    )
-
-                progress.file_start(filename)
-                try:
-                    if is_image:
-                        size = await with_heartbeat(
-                            download_file(
-                                url,
-                                dest,
-                                proxy=cfg.proxy,
-                                overwrite=cfg.overwrite,
-                                on_progress=progress.file_progress,
-                                on_retry=progress.retry,
-                            ),
-                            progress,
-                            filename,
-                        )
-                    elif variant.kind == HLS:
-                        size = await with_heartbeat(
-                            download_hls_async(
-                                url, dest, proxy=cfg.proxy, overwrite=cfg.overwrite
-                            ),
-                            progress,
-                            filename,
-                        )
-                    else:
-                        size = await with_heartbeat(
-                            download_file(
-                                url,
-                                dest,
-                                proxy=cfg.proxy,
-                                overwrite=cfg.overwrite,
-                                on_progress=progress.file_progress,
-                                on_retry=progress.retry,
-                            ),
-                            progress,
-                            filename,
-                        )
-                except (DownloadError, Exception) as exc:  # noqa: BLE001
-                    stats.failed += 1
-                    message = f"{tweet_id}: {type(exc).__name__}: {exc}"
-                    stats.errors.append(message)
-                    store.record_media(
-                        key,
-                        tweet_id,
-                        item.media_id,
-                        item.kind,
-                        url,
-                        status="failed",
-                        error=str(exc),
-                    )
-                    progress.file_end()
-                    progress.note(f"FAIL  {message}")
-                    if verbose:
-                        progress.note(describe_exception(exc))
-                        for hint in hints(exc):
-                            progress.note(f"      hint: {hint}")
-                    continue
-                finally:
-                    progress.file_end()
-
-                stats.downloaded += 1
-                stats.bytes += size
-                store.record_media(
-                    key,
-                    tweet_id,
-                    item.media_id,
-                    item.kind,
-                    url,
-                    status="done",
-                    path=str(dest),
-                    size=size,
-                )
-                if cfg.write_index:
-                    with index_path.open("a", encoding="utf-8") as fh:
-                        fh.write(
-                            json.dumps(
-                                {
-                                    "tweet_id": tweet_id,
-                                    "media_id": item.media_id,
-                                    "author": author,
-                                    "created_at": created,
-                                    "url": url,
-                                    "path": str(dest),
-                                    "bytes": size,
-                                    "downloaded_at": time.strftime(
-                                        "%Y-%m-%dT%H:%M:%S"
-                                    ),
-                                },
-                                ensure_ascii=False,
+                    if cfg.write_index:
+                        with index_path.open("a", encoding="utf-8") as fh:
+                            fh.write(
+                                json.dumps(
+                                    {
+                                        "tweet_id": tweet_id,
+                                        "media_id": item.media_id,
+                                        "author": author,
+                                        "created_at": created,
+                                        "url": url,
+                                        "path": str(dest),
+                                        "bytes": size,
+                                        "downloaded_at": time.strftime(
+                                            "%Y-%m-%dT%H:%M:%S"
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
                             )
-                            + "\n"
-                        )
-                progress.counter(
-                    tweets=stats.tweets_seen,
-                    videos=stats.tweets_with_video,
-                    ok=stats.downloaded,
-                    skip=stats.skipped,
-                    fail=stats.failed,
-                    size=human_bytes(stats.bytes),
-                )
-                progress.note(f"ok    {tweet_id} -> {filename}  ({size / 1e6:.1f} MB)")
+                    progress.counter(
+                        tweets=stats.tweets_seen,
+                        videos=stats.tweets_with_video,
+                        ok=stats.downloaded,
+                        skip=stats.skipped,
+                        fail=stats.failed,
+                        size=human_bytes(stats.bytes),
+                    )
+                    progress.note(f"ok    {tweet_id} -> {filename}  ({size / 1e6:.1f} MB)")
+
+            if cfg.max_size and probe is not None:
+                progress.note(f"probe : {probe.report()}")
 
     progress.finish()
     stats.skipped_start = state.skipped

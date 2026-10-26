@@ -32,6 +32,22 @@ from_page = 1
 # Also download images (off by default).
 download_images = false
 
+# The biggest file we are willing to download ("50MB", "1.5GB", 0 == no limit).
+# With a limit the best video variant that still fits into it is downloaded
+# instead of the one with the highest resolution.
+max_size = "0"
+
+# What to do when not even the smallest variant fits into max_size:
+#   false (default) -> download the smallest one anyway
+#   true            -> skip the video, the limit is a hard rule then
+max_size_strict = false
+
+# Measure the real size of a variant before downloading it (one small
+# request per variant, the answer is remembered in the database).
+# When it is off the size is estimated from the bitrate, which is about
+# twice too big - the limit is then roughly half as big as it looks.
+max_size_probe = true
+
 # {tweet_id} {user} {index} {ext} {date} {media_id}
 filename_template = "{tweet_id}_{user}_{index}{ext}"
 

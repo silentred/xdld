@@ -53,6 +53,7 @@ class ManifestEntry:
     author: str = ""
     created_at: str = ""
     page: int = 0  # the page of the likes timeline this tweet lives on
+    size: int = 0  # known size of the file (0 == unknown)
     extra: dict = field(default_factory=dict)
 
     @property
@@ -69,7 +70,7 @@ class ManifestEntry:
 
     @property
     def meta(self) -> dict:
-        return {
+        meta = {
             "tweet_id": self.tweet_id,
             "media_id": self.media_id,
             "kind": self.kind,
@@ -78,6 +79,9 @@ class ManifestEntry:
             "url": self.url,
             "page": self.page,
         }
+        if self.size:
+            meta["size"] = self.size
+        return meta
 
 
 def _as_int(value) -> int:
@@ -181,6 +185,7 @@ def parse_manifest(text: str) -> list[ManifestEntry]:
             author=str(meta.get("author", "")),
             created_at=str(meta.get("created_at", "")),
             page=_as_int(meta.get("page")),
+            size=_as_int(meta.get("size")),
         )
         entries.append(current)
 

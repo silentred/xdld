@@ -1,4 +1,4 @@
-from xdld.config import Config, load_config
+from xdld.config import Config, load_config, parse_size
 from xdld.runner import render_filename, safe_name
 
 
@@ -69,3 +69,83 @@ def test_cli_paths_resolve_against_the_cwd(tmp_path):
         None, base_dir=str(tmp_path), overrides={"cookies": "sub/c.json"}
     )
     assert cfg.cookies == str((tmp_path / "sub" / "c.json").resolve())
+
+
+def test_parse_size_understands_units():
+    assert parse_size("50MB") == 50 * 1024 * 1024
+    assert parse_size("50mb") == 50 * 1024 * 1024
+    assert parse_size("1.5GB") == int(1.5 * 1024**3)
+    assert parse_size("800K") == 800 * 1024
+    assert parse_size("1 GB") == 1024**3
+    assert parse_size(1234) == 1234
+    assert parse_size("0") == 0
+
+
+def test_parse_size_rejects_nonsense():
+    for value in ("abc", "50 potatoes", ""):
+        try:
+            parse_size(value)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {value!r}")
+
+
+def test_max_size_can_be_set_in_the_config_file(tmp_path):
+    (tmp_path / "xdld.toml").write_text('max_size = "50MB"\n', encoding="utf-8")
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 50 * 1024 * 1024
+
+
+def test_max_size_can_be_set_in_bytes(tmp_path):
+    (tmp_path / "xdld.toml").write_text("max_size = 12345\n", encoding="utf-8")
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 12345
+
+
+def test_max_size_can_be_set_in_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDLD_MAX_SIZE", "25MB")
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 25 * 1024 * 1024
+
+
+def test_the_environment_is_typed(tmp_path, monkeypatch):
+    """Without the fix every env value stayed a string."""
+    monkeypatch.setenv("XDLD_MAX_LIKES", "7")
+    monkeypatch.setenv("XDLD_DOWNLOAD_IMAGES", "false")
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_likes == 7
+    assert cfg.download_images is False
+
+
+def test_the_command_line_wins_over_the_config_file(tmp_path):
+    (tmp_path / "xdld.toml").write_text('max_size = "50MB"\n', encoding="utf-8")
+    cfg = load_config(None, base_dir=str(tmp_path), overrides={"max_size": "10MB"})
+    assert cfg.max_size == 10 * 1024 * 1024
+
+
+def test_the_size_flags_can_be_set_in_the_config_file(tmp_path):
+    (tmp_path / "xdld.toml").write_text(
+        "max_size = \"50MB\"\nmax_size_strict = true\nmax_size_probe = false\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 50 * 1024 * 1024
+    assert cfg.max_size_strict is True
+    assert cfg.max_size_probe is False
+
+
+def test_the_size_flags_can_be_set_in_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDLD_MAX_SIZE", "25MB")
+    monkeypatch.setenv("XDLD_MAX_SIZE_STRICT", "1")
+    monkeypatch.setenv("XDLD_MAX_SIZE_PROBE", "no")
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 25 * 1024 * 1024
+    assert cfg.max_size_strict is True
+    assert cfg.max_size_probe is False
+
+
+def test_the_size_flags_have_sane_defaults(tmp_path):
+    cfg = load_config(None, base_dir=str(tmp_path))
+    assert cfg.max_size == 0
+    assert cfg.max_size_strict is False
+    assert cfg.max_size_probe is True
